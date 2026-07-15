@@ -1,13 +1,12 @@
 #!/bin/bash
 
 # ==============================================================================
-# TWEAK KINERJA UTAMA UNTUK LINGKUNGAN CLOUD / RAILWAY
+# TWEAK KINERJA SISTEM (RAILWAY HIGH-THROUGHPUT)
 # ==============================================================================
-# 1. Naikkan batas maksimum open file descriptors agar kuat menampung ribuan koneksi serentak
+# Naikkan batas maksimum open file descriptors agar kuat menampung ribuan koneksi serentak
 ulimit -n 65535
 
-# 2. Tweak Network Stack (Jika kontainer memiliki hak akses/privilege sysctl)
-# Mempercepat daur ulang socket mati agar RAM tidak penuh oleh koneksi menggantung
+# Tweak Network Stack untuk mempercepat daur ulang port/socket mati (anti-stuck)
 sysctl -w net.ipv4.tcp_fin_timeout=15 2>/dev/null
 sysctl -w net.ipv4.tcp_tw_reuse=1 2>/dev/null
 sysctl -w net.core.somaxconn=4096 2>/dev/null
@@ -18,7 +17,7 @@ sysctl -w net.core.somaxconn=4096 2>/dev/null
 USER_NAME="${SSH_USER:-dd}"
 USER_PASS="${SSH_PASSWORD:-dd}"
 
-# Port PUBLIK Utama Railway (otomatis mendeteksi port dinamis Railway)
+# Port PUBLIK Utama Railway
 PUBLIC_PORT="${PORT:-8080}"
 
 # Port INTERNAL (Dipakai komunikasi antar-proses di dalam container)
@@ -29,7 +28,7 @@ echo "[*] Mengonfigurasi Server Message Dropbear (Banner Pra-Login)..."
 cat << 'EOF' > /etc/dropbear_banner
 =================================================
                   SELAMAT MENIKMATI
-             PREMIUM SSH SERVER DROPBEAR modssh3        
+             PREMIUM SSH SERVER DROPBEAR modssh        
 =================================================
        Dilarang Torrent / DDOS / Hacking! 
                  Powered By: dedefathu
@@ -75,6 +74,7 @@ connect = 127.0.0.1:22
 cert = /etc/stunnel/stunnel.pem
 EOF
 
+# --- Catatan: Akses menu otomatis di .bashrc sudah dihapus agar bersih dari error ---
 echo "[*] Menambahkan sesuatu di .bashrc..."
 cat <<'EOF'>> ~/.bashrc
 clear
@@ -87,8 +87,6 @@ alias c='clear'
 alias x='exit'
 alias +x='chmod +x'
 alias cls='clear;ls'
-
-menu
 EOF
 
 echo "[*] Memulai Stunnel (internal, port $SSL_INTERNAL_PORT)..."
@@ -102,13 +100,14 @@ else
     echo "[!] CF_TUNNEL_TOKEN tidak diset -> Cloudflare Tunnel dilewati."
 fi
 
-echo "[*] Memulai All-in-One Multiplexer & WS Proxy Ter-Tweak di Port PUBLIK $PUBLIC_PORT..."
-# Mengeksekusi script Python gabungan yang sudah di-tweak performanya
+echo "[*] Memulai WebSocket Proxy (Golang Engine internal) di Port $WS_INTERNAL_PORT..."
+# Dijalankan di background (&) agar script terus berjalan ke bawah
+WS_PORT="$WS_INTERNAL_PORT" /usr/local/bin/wsproxy &
+
+echo "[*] Memulai Multiplexer Publik (Golang Engine) di Port PUBLIK $PUBLIC_PORT..."
+# Menggunakan exec untuk mengunci proses utama kontainer ke Mux publik
 exec env \
     PORT="$PUBLIC_PORT" \
-    SSL_TARGET_HOST="127.0.0.1" \
-    SSL_TARGET_PORT="$SSL_INTERNAL_PORT" \
-    WS_PORT="$WS_INTERNAL_PORT" \
-    WS_TARGET_HOST="127.0.0.1" \
-    WS_TARGET_PORT="22" \
-    python3 /usr/local/bin/mux_ws_proxy_railway.py
+    SSL_TARGET_HOST="127.0.0.1" SSL_TARGET_PORT="$SSL_INTERNAL_PORT" \
+    WS_MUX_TARGET_HOST="127.0.0.1" WS_MUX_TARGET_PORT="$WS_INTERNAL_PORT" \
+    /usr/local/bin/mux
