@@ -1,9 +1,9 @@
 package main
 
 import (
-	"bytes"
 	"crypto/sha1"
 	"encoding/base64"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -13,8 +13,7 @@ import (
 
 const (
 	WSMagic      = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-	BufferSize   = 131072 // 128KB untuk kapasitas pipa data lebih longgar
-	SocketBuffer = 262144 // 256KB untuk buffer read/write di level OS Kernel
+	SocketBuffer = 524288 // DI-BOOST: 512KB Buffer Kernel biar pipa bandwidth super longgar
 )
 
 func main() {
@@ -30,7 +29,7 @@ func main() {
 	}
 	defer listener.Close()
 
-	log.Printf("[WS Engine] Listen internal aktif di 127.0.0.1:%s -> Forward ke SSH: %s", wsPort, sshTarget)
+	log.Printf("[WS Engine] Extreme Speed Mode Aktif di 127.0.0.1:%s", wsPort)
 
 	for {
 		clientConn, err := listener.Accept()
@@ -43,13 +42,13 @@ func main() {
 
 func tweakSocket(conn net.Conn) {
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
-		_ = tcpConn.SetNoDelay(true)                  // Mematikan Nagle (Instant Response)
+		_ = tcpConn.SetNoDelay(true) // Instant transmission
 		_ = tcpConn.SetKeepAlive(true)                 
 		_ = tcpConn.SetKeepAlivePeriod(10 * time.Second)
 		
-		// TWEAK PREMIUM SPEED UP (Komentar sudah diperbaiki ke Go standard)
-		_ = tcpConn.SetReadBuffer(SocketBuffer)  // Paksa OS kasih buffer baca raksasa
-		_ = tcpConn.SetWriteBuffer(SocketBuffer) // Paksa OS kasih buffer tulis raksasa
+		// Paksa Kernel mengalokasikan memori buffer raksasa untuk speedtest
+		_ = tcpConn.SetReadBuffer(SocketBuffer)  
+		_ = tcpConn.SetWriteBuffer(SocketBuffer) 
 	}
 }
 
@@ -57,6 +56,7 @@ func handleWS(client net.Conn, sshTarget string) {
 	tweakSocket(client)
 	defer client.Close()
 
+	// Baca HTTP Header awal (maksimal 4096 byte)
 	headerBuf := make([]byte, 4096)
 	n, err := client.Read(headerBuf)
 	if err != nil || n == 0 {
@@ -100,7 +100,8 @@ func handleWS(client net.Conn, sshTarget string) {
 		_, _ = client.Write([]byte(defaultResp))
 	}
 
-	sshConn, err := net.DialTimeout("tcp", sshTarget, 5*time.Second)
+	// Konek ke Dropbear SSH Backend
+	sshConn, err := net.DialTimeout("tcp", sshTarget, 4*time.Second)
 	if err != nil {
 		return
 	}
@@ -109,55 +110,41 @@ func handleWS(client net.Conn, sshTarget string) {
 
 	done := make(chan struct{}, 2)
 
+	// --- ULTRA BYPASS ENGINE (ANTI-LEMOTE & ANTI-REKONEK) ---
 	go func() {
 		defer func() { done <- struct{}{} }()
-		buffer := make([]byte, BufferSize)
-		firstPacket := true
-		var totalRead int
+		
+		// Paket Pertama: Biasanya berisi payload injector manipulasi HTTP
+		buf1 := make([]byte, 32768)
+		n1, err := client.Read(buf1)
+		if err != nil || n1 == 0 {
+			return
+		}
 
-		for {
-			n, err := client.Read(buffer)
-			if n > 0 {
-				data := buffer[:n]
-				totalRead += n
-
-				if firstPacket {
-					if idx := bytes.Index(data, []byte("SSH-")); idx != -1 {
-						data = data[idx:]
-						firstPacket = false 
-					} else if totalRead > 4096 {
-						firstPacket = false
-					} else {
-						continue
-					}
-				}
-				
-				_, wErr := sshConn.Write(data)
-				if wErr != nil {
-					return
-				}
-			}
-			if err != nil {
-				return
+		// Cari posisi aman text banner SSH dari payload pembuka
+		dataPayload := buf1[:n1]
+		for i := 0; i < len(dataPayload)-4; i++ {
+			if dataPayload[i] == 'S' && dataPayload[i+1] == 'S' && dataPayload[i+2] == 'H' && dataPayload[i+3] == '-' {
+				dataPayload = dataPayload[i:]
+				break
 			}
 		}
+
+		// Kirim data bersih awal ke Dropbear
+		_, err = sshConn.Write(dataPayload)
+		if err != nil {
+			return
+		}
+
+		// SETELAH PAKET 1 SELESAI, BYPASS TOTAL TANPA FILTER SAMA SEKALI!
+		// Menggunakan io.Copy agar data dilempar langsung via kernel space (Speed Murni Tanpa Hambatan)
+		_, _ = io.Copy(sshConn, client)
 	}()
 
+	// Jalur Arah Sebaliknya (SSH -> Client) - Full Speed Bypass
 	go func() {
 		defer func() { done <- struct{}{} }()
-		buffer := make([]byte, BufferSize)
-		for {
-			n, err := sshConn.Read(buffer)
-			if n > 0 {
-				_, wErr := client.Write(buffer[:n])
-				if wErr != nil {
-					return
-				}
-			}
-			if err != nil {
-				return
-			}
-		}
+		_, _ = io.Copy(client, sshConn)
 	}()
 
 	<-done
