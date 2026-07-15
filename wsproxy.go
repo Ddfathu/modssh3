@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"crypto/sha1"
 	"encoding/base64"
-	"io"
 	"log"
 	"net"
 	"os"
@@ -13,9 +12,8 @@ import (
 )
 
 const (
-	WSMagic      = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-	SocketBuffer = 524288 // 512KB Buffer OS biar data upload gak antre
-	ChunkBuffer  = 131072 // 128KB Pipa data internal
+	WSMagic    = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+	BufferSize = 65536 // 64KB Buffer untuk performa maksimal
 )
 
 func main() {
@@ -31,7 +29,7 @@ func main() {
 	}
 	defer listener.Close()
 
-	log.Printf("[WS Engine] Mode High-Throughput Aktif di Port %s", wsPort)
+	log.Printf("[WS Engine] Listen internal aktif di 127.0.0.1:%s -> Forward ke SSH: %s", wsPort, sshTarget)
 
 	for {
 		clientConn, err := listener.Accept()
@@ -44,13 +42,9 @@ func main() {
 
 func tweakSocket(conn net.Conn) {
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
-		_ = tcpConn.SetNoDelay(true) 
-		_ = tcpConn.SetKeepAlive(true)
-		_ = tcpConn.SetKeepAlivePeriod(10 * time.Second)
-		
-		// Set buffer kernel raksasa khusus Railway
-		_ = tcpConn.SetReadBuffer(SocketBuffer)
-		_ = tcpConn.SetWriteBuffer(SocketBuffer)
+		_ = tcpConn.SetNoDelay(true)                  // Matikan Nagle Algorithm (Anti-delay)
+		_ = tcpConn.SetKeepAlive(true)                 // Aktifkan TCP Keepalive
+		_ = tcpConn.SetKeepAlivePeriod(10 * time.Second) // Cek berkala setiap 10 detik
 	}
 }
 
@@ -58,7 +52,7 @@ func handleWS(client net.Conn, sshTarget string) {
 	tweakSocket(client)
 	defer client.Close()
 
-	// Baca header HTTP awal (Maksimal 4096 byte)
+	// Baca HTTP Header (Maksimal 4096 byte agar kebal payload jumbo)
 	headerBuf := make([]byte, 4096)
 	n, err := client.Read(headerBuf)
 	if err != nil || n == 0 {
@@ -68,6 +62,7 @@ func handleWS(client net.Conn, sshTarget string) {
 	rawHeaders := string(headerBuf[:n])
 	rawLower := strings.ToLower(rawHeaders)
 
+	// Proses jabat tangan (handshake) WebSocket
 	if strings.Contains(rawLower, "upgrade: websocket") || strings.Contains(rawLower, "websocket") {
 		wsKey := ""
 		lines := strings.Split(rawHeaders, "\r\n")
@@ -102,8 +97,8 @@ func handleWS(client net.Conn, sshTarget string) {
 		_, _ = client.Write([]byte(defaultResp))
 	}
 
-	// Dial ke Dropbear
-	sshConn, err := net.DialTimeout("tcp", sshTarget, 4*time.Second)
+	// Hubungkan ke Dropbear SSH Backend
+	sshConn, err := net.DialTimeout("tcp", sshTarget, 5*time.Second)
 	if err != nil {
 		return
 	}
@@ -112,39 +107,63 @@ func handleWS(client net.Conn, sshTarget string) {
 
 	done := make(chan struct{}, 2)
 
-	// --- STREAM ENGINE KENCANG & ANTI-SUNEK ---
+	// --- FIX DROPBEAR FILTER: ANTI-REKONEK PAS UPLOAD SPEEDTEST ---
 	go func() {
 		defer func() { done <- struct{}{} }()
-		
-		// Gunakan buffer 128KB langsung untuk menampung data pembuka HTTP Custom
-		initBuf := make([]byte, ChunkBuffer)
-		nData, err := client.Read(initBuf)
-		if err != nil || nData == 0 {
-			return
-		}
+		buffer := make([]byte, BufferSize)
+		firstPacket := true
+		var totalRead int
 
-		dataPayload := initBuf[:nData]
-		// Kupas payload nyari banner Dropbear SSH-
-		if idx := bytes.Index(dataPayload, []byte("SSH-")); idx != -1 {
-			dataPayload = dataPayload[idx:]
-		}
+		for {
+			n, err := client.Read(buffer)
+			if n > 0 {
+				data := buffer[:n]
+				totalRead += n
 
-		// Kirim data pembuka yang sudah bersih
-		_, err = sshConn.Write(dataPayload)
-		if err != nil {
-			return
+				if firstPacket {
+					// 1. Cek secara presisi keberadaan banner SSH
+					if idx := bytes.Index(data, []byte("SSH-")); idx != -1 {
+						data = data[idx:]
+						firstPacket = false // Banner ketemu, matikan filter selamanya
+					} else if totalRead > 4096 {
+						// 2. TWEAK UPLOAD BYPASS:
+						// Jika data yang masuk dari client sudah membanjiri > 4KB tapi banner SSH- belum lewat,
+						// ini dipastikan merupakan stream data upload besar/speedtest.
+						// Bypass paksa filter agar paket data tidak dibuang dan VPN tidak timeout/DC.
+						firstPacket = false
+					} else {
+						// 3. Jika masih paket awal berukuran kecil dan isinya sampah manipulasi operator, buang keluar.
+						continue
+					}
+				}
+				
+				_, wErr := sshConn.Write(data)
+				if wErr != nil {
+					return
+				}
+			}
+			if err != nil {
+				return
+			}
 		}
-
-		// BYPASS KECEPATAN TINGGI: Gunakan CopyBuffer dengan size 128KB untuk sisa data upload
-		uploadPool := make([]byte, ChunkBuffer)
-		_, _ = io.CopyBuffer(sshConn, client, uploadPool)
 	}()
 
-	// Jalur Download (SSH -> Client) - Full Speed
+	// Pipe arah sebaliknya (SSH/Dropbear -> Client) - Full Loss tanpa filter
 	go func() {
 		defer func() { done <- struct{}{} }()
-		downloadPool := make([]byte, ChunkBuffer)
-		_, _ = io.CopyBuffer(client, sshConn, downloadPool)
+		buffer := make([]byte, BufferSize)
+		for {
+			n, err := sshConn.Read(buffer)
+			if n > 0 {
+				_, wErr := client.Write(buffer[:n])
+				if wErr != nil {
+					return
+				}
+			}
+			if err != nil {
+				return
+			}
+		}
 	}()
 
 	<-done
