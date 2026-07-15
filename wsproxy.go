@@ -13,7 +13,7 @@ import (
 
 const (
 	WSMagic    = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-	BufferSize = 65536
+	BufferSize = 65536 // 64KB Buffer untuk performa maksimal
 )
 
 func main() {
@@ -42,9 +42,9 @@ func main() {
 
 func tweakSocket(conn net.Conn) {
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
-		_ = tcpConn.SetNoDelay(true)
-		_ = tcpConn.SetKeepAlive(true)
-		_ = tcpConn.SetKeepAlivePeriod(10 * time.Second)
+		_ = tcpConn.SetNoDelay(true)                  // Matikan Nagle Algorithm (Anti-delay)
+		_ = tcpConn.SetKeepAlive(true)                 // Aktifkan TCP Keepalive
+		_ = tcpConn.SetKeepAlivePeriod(10 * time.Second) // Cek berkala setiap 10 detik
 	}
 }
 
@@ -62,7 +62,7 @@ func handleWS(client net.Conn, sshTarget string) {
 	rawHeaders := string(headerBuf[:n])
 	rawLower := strings.ToLower(rawHeaders)
 
-	// Cek apakah ada request upgrade websocket
+	// Proses jabat tangan (handshake) WebSocket
 	if strings.Contains(rawLower, "upgrade: websocket") || strings.Contains(rawLower, "websocket") {
 		wsKey := ""
 		lines := strings.Split(rawHeaders, "\r\n")
@@ -80,19 +80,16 @@ func handleWS(client net.Conn, sshTarget string) {
 			wsKey = base64.StdEncoding.EncodeToString([]byte(time.Now().String()))
 		}
 
-		// Hitung Accept Key
 		h := sha1.New()
 		h.Write([]byte(wsKey + WSMagic))
 		acceptKey := base64.StdEncoding.EncodeToString(h.Sum(nil))
 
-		// Kirim Respon 101 Switching Protocols
 		response := "HTTP/1.1 101 Switching Protocols\r\n" +
 			"Upgrade: websocket\r\n" +
 			"Connection: Upgrade\r\n" +
 			"Sec-WebSocket-Accept: " + acceptKey + "\r\n\r\n"
 		_, _ = client.Write([]byte(response))
 	} else {
-		// Default response jika bukan websocket
 		defaultResp := os.Getenv("WS_RESPONSE")
 		if defaultResp == "" {
 			defaultResp = "HTTP/1.1 101 Switching Protocols\r\n\r\n"
@@ -110,25 +107,36 @@ func handleWS(client net.Conn, sshTarget string) {
 
 	done := make(chan struct{}, 2)
 
-	// --- DROPBEAR FILTER IMPLEMENTATION (Mencari Banner SSH-) ---
+	// --- FIX DROPBEAR FILTER: ANTI-REKONEK PAS UPLOAD SPEEDTEST ---
 	go func() {
 		defer func() { done <- struct{}{} }()
 		buffer := make([]byte, BufferSize)
 		firstPacket := true
+		var totalRead int
 
 		for {
 			n, err := client.Read(buffer)
 			if n > 0 {
 				data := buffer[:n]
+				totalRead += n
+
 				if firstPacket {
+					// 1. Cek secara presisi keberadaan banner SSH
 					if idx := bytes.Index(data, []byte("SSH-")); idx != -1 {
 						data = data[idx:]
+						firstPacket = false // Banner ketemu, matikan filter selamanya
+					} else if totalRead > 4096 {
+						// 2. TWEAK UPLOAD BYPASS:
+						// Jika data yang masuk dari client sudah membanjiri > 4KB tapi banner SSH- belum lewat,
+						// ini dipastikan merupakan stream data upload besar/speedtest.
+						// Bypass paksa filter agar paket data tidak dibuang dan VPN tidak timeout/DC.
 						firstPacket = false
 					} else {
-						// Saring enhanced payload sampah operator luar
+						// 3. Jika masih paket awal berukuran kecil dan isinya sampah manipulasi operator, buang keluar.
 						continue
 					}
 				}
+				
 				_, wErr := sshConn.Write(data)
 				if wErr != nil {
 					return
@@ -140,7 +148,7 @@ func handleWS(client net.Conn, sshTarget string) {
 		}
 	}()
 
-	// Pipe arah sebaliknya (SSH -> Client)
+	// Pipe arah sebaliknya (SSH/Dropbear -> Client) - Full Loss tanpa filter
 	go func() {
 		defer func() { done <- struct{}{} }()
 		buffer := make([]byte, BufferSize)
