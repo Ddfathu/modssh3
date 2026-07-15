@@ -12,8 +12,8 @@ import (
 )
 
 const (
-	WSMagic    = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-	BufferSize = 131072 // Naik ke 128KB untuk kapasitas pipa data lebih longgar
+	WSMagic      = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+	BufferSize   = 131072 // 128KB untuk kapasitas pipa data lebih longgar
 	SocketBuffer = 262144 // 256KB untuk buffer read/write di level OS Kernel
 )
 
@@ -47,7 +47,7 @@ func tweakSocket(conn net.Conn) {
 		_ = tcpConn.SetKeepAlive(true)                 
 		_ = tcpConn.SetKeepAlivePeriod(10 * time.Second)
 		
-		# --- TWEAK PREMIUM SPEED UP ---
+		// TWEAK PREMIUM SPEED UP (Komentar sudah diperbaiki ke Go standard)
 		_ = tcpConn.SetReadBuffer(SocketBuffer)  // Paksa OS kasih buffer baca raksasa
 		_ = tcpConn.SetWriteBuffer(SocketBuffer) // Paksa OS kasih buffer tulis raksasa
 	}
