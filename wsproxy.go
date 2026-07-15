@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha1"
 	"encoding/base64"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -12,8 +13,9 @@ import (
 )
 
 const (
-	WSMagic    = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-	BufferSize = 65536 // 64KB Buffer untuk performa maksimal
+	WSMagic      = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+	BufferSize   = 131072 // DI-BOOST: 128KB Buffer internal untuk kecepatan maksimal
+	SocketBuffer = 524288 // DI-BOOST: 512KB Kernel Socket Buffer (Anti-Leher Botol / Rata Kanan)
 )
 
 func main() {
@@ -29,7 +31,7 @@ func main() {
 	}
 	defer listener.Close()
 
-	log.Printf("[WS Engine] Listen internal aktif di 127.0.0.1:%s -> Forward ke SSH: %s", wsPort, sshTarget)
+	log.Printf("[WS Engine] Listen internal aktif di 127.0.0.1:%s -> High-Speed Mode", wsPort)
 
 	for {
 		clientConn, err := listener.Accept()
@@ -45,6 +47,10 @@ func tweakSocket(conn net.Conn) {
 		_ = tcpConn.SetNoDelay(true)                  // Matikan Nagle Algorithm (Anti-delay)
 		_ = tcpConn.SetKeepAlive(true)                 // Aktifkan TCP Keepalive
 		_ = tcpConn.SetKeepAlivePeriod(10 * time.Second) // Cek berkala setiap 10 detik
+		
+		// SUNTIKAN HIGH-SPEED: Paksa OS mengalokasikan memori buffer raksasa untuk speedtest upload/download
+		_ = tcpConn.SetReadBuffer(SocketBuffer)
+		_ = tcpConn.SetWriteBuffer(SocketBuffer)
 	}
 }
 
@@ -148,22 +154,10 @@ func handleWS(client net.Conn, sshTarget string) {
 		}
 	}()
 
-	// Pipe arah sebaliknya (SSH/Dropbear -> Client) - Full Loss tanpa filter
+	// Pipe arah sebaliknya (SSH/Dropbear -> Client) - Full Speed Bypass Zero-Copy
 	go func() {
 		defer func() { done <- struct{}{} }()
-		buffer := make([]byte, BufferSize)
-		for {
-			n, err := sshConn.Read(buffer)
-			if n > 0 {
-				_, wErr := client.Write(buffer[:n])
-				if wErr != nil {
-					return
-				}
-			}
-			if err != nil {
-				return
-			}
-		}
+		_, _ = io.Copy(client, sshConn)
 	}()
 
 	<-done
