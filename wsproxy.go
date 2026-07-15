@@ -13,7 +13,8 @@ import (
 
 const (
 	WSMagic    = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-	BufferSize = 65536 // 64KB Buffer untuk performa maksimal
+	BufferSize = 131072 // Naik ke 128KB untuk kapasitas pipa data lebih longgar
+	SocketBuffer = 262144 // 256KB untuk buffer read/write di level OS Kernel
 )
 
 func main() {
@@ -42,9 +43,13 @@ func main() {
 
 func tweakSocket(conn net.Conn) {
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
-		_ = tcpConn.SetNoDelay(true)                  // Matikan Nagle Algorithm (Anti-delay)
-		_ = tcpConn.SetKeepAlive(true)                 // Aktifkan TCP Keepalive
-		_ = tcpConn.SetKeepAlivePeriod(10 * time.Second) // Cek berkala setiap 10 detik
+		_ = tcpConn.SetNoDelay(true)                  // Mematikan Nagle (Instant Response)
+		_ = tcpConn.SetKeepAlive(true)                 
+		_ = tcpConn.SetKeepAlivePeriod(10 * time.Second)
+		
+		# --- TWEAK PREMIUM SPEED UP ---
+		_ = tcpConn.SetReadBuffer(SocketBuffer)  // Paksa OS kasih buffer baca raksasa
+		_ = tcpConn.SetWriteBuffer(SocketBuffer) // Paksa OS kasih buffer tulis raksasa
 	}
 }
 
@@ -52,7 +57,6 @@ func handleWS(client net.Conn, sshTarget string) {
 	tweakSocket(client)
 	defer client.Close()
 
-	// Baca HTTP Header (Maksimal 4096 byte agar kebal payload jumbo)
 	headerBuf := make([]byte, 4096)
 	n, err := client.Read(headerBuf)
 	if err != nil || n == 0 {
@@ -62,7 +66,6 @@ func handleWS(client net.Conn, sshTarget string) {
 	rawHeaders := string(headerBuf[:n])
 	rawLower := strings.ToLower(rawHeaders)
 
-	// Proses jabat tangan (handshake) WebSocket
 	if strings.Contains(rawLower, "upgrade: websocket") || strings.Contains(rawLower, "websocket") {
 		wsKey := ""
 		lines := strings.Split(rawHeaders, "\r\n")
@@ -97,7 +100,6 @@ func handleWS(client net.Conn, sshTarget string) {
 		_, _ = client.Write([]byte(defaultResp))
 	}
 
-	// Hubungkan ke Dropbear SSH Backend
 	sshConn, err := net.DialTimeout("tcp", sshTarget, 5*time.Second)
 	if err != nil {
 		return
@@ -107,7 +109,6 @@ func handleWS(client net.Conn, sshTarget string) {
 
 	done := make(chan struct{}, 2)
 
-	// --- FIX DROPBEAR FILTER: ANTI-REKONEK PAS UPLOAD SPEEDTEST ---
 	go func() {
 		defer func() { done <- struct{}{} }()
 		buffer := make([]byte, BufferSize)
@@ -121,18 +122,12 @@ func handleWS(client net.Conn, sshTarget string) {
 				totalRead += n
 
 				if firstPacket {
-					// 1. Cek secara presisi keberadaan banner SSH
 					if idx := bytes.Index(data, []byte("SSH-")); idx != -1 {
 						data = data[idx:]
-						firstPacket = false // Banner ketemu, matikan filter selamanya
+						firstPacket = false 
 					} else if totalRead > 4096 {
-						// 2. TWEAK UPLOAD BYPASS:
-						// Jika data yang masuk dari client sudah membanjiri > 4KB tapi banner SSH- belum lewat,
-						// ini dipastikan merupakan stream data upload besar/speedtest.
-						// Bypass paksa filter agar paket data tidak dibuang dan VPN tidak timeout/DC.
 						firstPacket = false
 					} else {
-						// 3. Jika masih paket awal berukuran kecil dan isinya sampah manipulasi operator, buang keluar.
 						continue
 					}
 				}
@@ -148,7 +143,6 @@ func handleWS(client net.Conn, sshTarget string) {
 		}
 	}()
 
-	// Pipe arah sebaliknya (SSH/Dropbear -> Client) - Full Loss tanpa filter
 	go func() {
 		defer func() { done <- struct{}{} }()
 		buffer := make([]byte, BufferSize)
