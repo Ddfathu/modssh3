@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"io"
 	"log"
 	"net"
@@ -10,7 +11,7 @@ import (
 
 const (
 	TLSHandshakeByte = 0x16
-	SocketBuffer     = 524288 // DI-BOOST: 512KB Kernel Socket Buffer (Anti Mampet Pas Upload)
+	SocketBuffer     = 524288 // 512KB Kernel Socket Buffer
 )
 
 func main() {
@@ -48,11 +49,9 @@ func main() {
 
 func tweakSocket(conn net.Conn) {
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
-		_ = tcpConn.SetNoDelay(true) // Matikan Nagle's Algorithm (Anti Delay / Instant Response)
+		_ = tcpConn.SetNoDelay(true)
 		_ = tcpConn.SetKeepAlive(true)
-		_ = tcpConn.SetKeepAlivePeriod(10 * time.Second) // Keepalive agresif 10 detik
-		
-		// SUNTIKAN HIGH-SPEED: Paksa kernel alokasikan buffer raksasa agar speed upload losss!
+		_ = tcpConn.SetKeepAlivePeriod(10 * time.Second)
 		_ = tcpConn.SetReadBuffer(SocketBuffer)
 		_ = tcpConn.SetWriteBuffer(SocketBuffer)
 	}
@@ -62,17 +61,27 @@ func handleClient(client net.Conn, sslTarget, wsTarget string) {
 	tweakSocket(client)
 	defer client.Close()
 
-	// Intip 1 byte pertama
-	firstByte := make([]byte, 1)
-	_, err := client.Read(firstByte)
-	if err != nil {
-		return
-	}
+	// Gunakan Buffered Reader supaya bisa ngintip data tanpa merusak stream asli
+	reader := bufio.NewReaderSize(client, 1024)
+
+	// Batasi waktu ngintip byte pertama (Anti-Stuck / Anti-Sunek)
+	// Jika dalam 3 detik client ga kirim data, otomatis anggap sebagai WS/Payload standar
+	_ = client.SetReadDeadline(time.Now().Add(3 * time.Second))
+	
+	// Intip 1 byte pertama tanpa membuangnya dari buffer
+	firstByte, err := reader.Peek(1)
+	
+	// Reset kembali deadline ke normal agar koneksi tidak terputus setelah 3 detik
+	_ = client.SetReadDeadline(time.Time{})
 
 	var targetAddr string
 	var label string
 
-	if firstByte[0] == TLSHandshakeByte {
+	// Jika timeout atau gagal baca, default dialihkan ke WS-Proxy (biasanya payload injeksi nunggu respon)
+	if err != nil {
+		targetAddr = wsTarget
+		label = "WS-Proxy (Default/Timeout)"
+	} else if firstByte[0] == TLSHandshakeByte {
 		targetAddr = sslTarget
 		label = "SSL/Stunnel"
 	} else {
@@ -90,17 +99,11 @@ func handleClient(client net.Conn, sslTarget, wsTarget string) {
 	tweakSocket(backendConn)
 	defer backendConn.Close()
 
-	// Tembakkan kembali byte yang diintip tadi ke backend
-	_, err = backendConn.Write(firstByte)
-	if err != nil {
-		return
-	}
-
-	// Relay data 2 arah secara simultan menggunakan io.Copy (Zero-Copy System Call)
-	// Menghilangkan CPU bottleneck pas data upload speedtest diperas abis
+	// PENTING: Tulis ulang data yang sudah dibaca di buffer (termasuk byte yang diintip tadi)
+	// io.Copy tidak bisa dipakai langsung dari 'client' karena datanya sudah tertahan di 'reader'
 	done := make(chan struct{}, 2)
 	go func() {
-		_, _ = io.Copy(backendConn, client)
+		_, _ = io.Copy(backendConn, reader) // Mengalirkan data dari buffer reader ke backend
 		done <- struct{}{}
 	}()
 	go func() {
