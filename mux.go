@@ -61,27 +61,23 @@ func handleClient(client net.Conn, sslTarget, wsTarget string) {
 	tweakSocket(client)
 	defer client.Close()
 
-	// Gunakan Buffered Reader supaya bisa ngintip data tanpa merusak stream asli
-	reader := bufio.NewReaderSize(client, 1024)
+	// Perbesar buffer reader jadi 4KB supaya aman menampung payload jumbo lu saat diintip
+	reader := bufio.NewReaderSize(client, 4096)
 
-	// Batasi waktu ngintip byte pertama (Anti-Stuck / Anti-Sunek)
-	// Jika dalam 3 detik client ga kirim data, otomatis anggap sebagai WS/Payload standar
-	_ = client.SetReadDeadline(time.Now().Add(3 * time.Second))
+	// Batasi waktu ngintip byte pertama (5 detik agar toleran pada jaringan naik turun)
+	_ = client.SetReadDeadline(time.Now().Add(5 * time.Second))
 	
-	// Intip 1 byte pertama tanpa membuangnya dari buffer
-	firstByte, err := reader.Peek(1)
+	// Intip 4 byte pertama tanpa membuangnya dari buffer
+	firstBytes, err := reader.Peek(4)
 	
-	// Reset kembali deadline ke normal agar koneksi tidak terputus setelah 3 detik
+	// Reset kembali deadline ke normal agar koneksi tidak terputus
 	_ = client.SetReadDeadline(time.Time{})
 
 	var targetAddr string
 	var label string
 
-	// Jika timeout atau gagal baca, default dialihkan ke WS-Proxy (biasanya payload injeksi nunggu respon)
-	if err != nil {
-		targetAddr = wsTarget
-		label = "WS-Proxy (Default/Timeout)"
-	} else if firstByte[0] == TLSHandshakeByte {
+	// Pengecekan TLS yang lebih presisi
+	if err == nil && len(firstBytes) > 0 && firstBytes[0] == TLSHandshakeByte {
 		targetAddr = sslTarget
 		label = "SSL/Stunnel"
 	} else {
@@ -99,16 +95,19 @@ func handleClient(client net.Conn, sslTarget, wsTarget string) {
 	tweakSocket(backendConn)
 	defer backendConn.Close()
 
-	// PENTING: Tulis ulang data yang sudah dibaca di buffer (termasuk byte yang diintip tadi)
-	// io.Copy tidak bisa dipakai langsung dari 'client' karena datanya sudah tertahan di 'reader'
 	done := make(chan struct{}, 2)
+	
+	// PENGIRIMAN DATA DENGAN BUFFER JUMBO (ANTI-DROP PAS YOUTUBE)
 	go func() {
-		_, _ = io.Copy(backendConn, reader) // Mengalirkan data dari buffer reader ke backend
-		done <- struct{}{}
+		defer func() { done <- struct{}{} }()
+		buf := make([]byte, SocketBuffer)
+		_, _ = io.CopyBuffer(backendConn, reader, buf) 
 	}()
+	
 	go func() {
-		_, _ = io.Copy(client, backendConn)
-		done <- struct{}{}
+		defer func() { done <- struct{}{} }()
+		buf := make([]byte, SocketBuffer)
+		_, _ = io.CopyBuffer(client, backendConn, buf)
 	}()
 
 	<-done
