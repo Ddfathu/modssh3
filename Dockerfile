@@ -1,39 +1,44 @@
-# Stage 1: Builder untuk Go Binary dan BadVPN UDPGW
+# Stage 1: Hanya untuk build Go Binary (Mux & Wsproxy) agar tetap ringan
 FROM golang:1.22-alpine AS builder
-RUN apk update && apk add --no-cache cmake make gcc g++ musl-dev linux-headers curl
-
 WORKDIR /app
-# Menyalin dan kompilasi langsung di dalam docker agar binary-nya super ringan
 COPY mux.go .
 COPY wsproxy.go .
 RUN go build -ldflags="-s -w" -o /usr/local/bin/mux mux.go
 RUN go build -ldflags="-s -w" -o /usr/local/bin/wsproxy wsproxy.go
 
-# Download dan Compile BadVPN dari Source Resmi
-WORKDIR /src
-RUN curl -fsSL https://github.com/ambrop72/badvpn/archive/refs/tags/1.999.130.tar.gz | tar -xz \
-    && cd badvpn-1.999.130 \
-    && mkdir build && cd build \
-    && cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 \
-    && make badvpn-udpgw \
-    && cp udpgw/badvpn-udpgw /usr/local/bin/badvpn-udpgw
-
 # Stage 2: Runner Utama menggunakan Ubuntu 22.04
 FROM ubuntu:22.04
 ENV DEBIAN_FRONTEND=noninteractive
 
+# Install dependencies bawaan + tools buat compile BadVPN langsung di Ubuntu
 RUN apt-get update && apt-get install -y \
     dropbear \
     stunnel4 \
     openssl \
     sudo \
     curl \
+    cmake \
+    make \
+    gcc \
+    g++ \
     && rm -rf /var/lib/apt/lists/*
 
-# Ambil seluruh binary dari tahap builder (Termasuk BadVPN)
+# Ambil binary Go dari Stage 1
 COPY --from=builder /usr/local/bin/mux /usr/local/bin/mux
 COPY --from=builder /usr/local/bin/wsproxy /usr/local/bin/wsproxy
-COPY --from=builder /usr/local/bin/badvpn-udpgw /usr/local/bin/badvpn-udpgw
+
+# COMPILE BADVPN LANGSUNG DI UBUNTU (Biar klop & gak korup)
+WORKDIR /src
+RUN curl -fsSL https://github.com/ambrop72/badvpn/archive/refs/tags/1.999.130.tar.gz | tar -xz \
+    && cd badvpn-1.999.130 \
+    && mkdir build && cd build \
+    && cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 \
+    && make badvpn-udpgw \
+    && cp udpgw/badvpn-udpgw /usr/local/bin/badvpn-udpgw \
+    && cd / && rm -rf /src
+
+# Pindah kembali ke folder utama app
+WORKDIR /app
 
 # Install cloudflared
 RUN curl -fsSL -o /usr/local/bin/cloudflared \
