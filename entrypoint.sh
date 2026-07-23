@@ -104,6 +104,13 @@ echo "[*] Memulai WebSocket Proxy (Golang Engine internal) di Port $WS_INTERNAL_
 # Dijalankan di background (&) agar script terus berjalan ke bawah
 WS_PORT="$WS_INTERNAL_PORT" /usr/local/bin/wsproxy &
 
+# ==============================================================================
+# SEKTOR PENYUNTIKAN ENGINE BADVPN UDPGW (CUSTOM TUNNELING GAME/WEBRTC)
+# ==============================================================================
+echo "[*] Memulai BadVPN UDPGW Engine di Port Lokal 7300..."
+# Berjalan di background (&) untuk meneruskan paket UDP dari HTTP Custom / Zivpn
+/usr/local/bin/badvpn-udpgw --listen-addr 127.0.0.1:7300 --max-clients 500 --max-connections-for-client 20 &
+
 echo "[*] Memulai Multiplexer Publik (Golang Engine) di Port PUBLIK $PUBLIC_PORT..."
 # Menggunakan exec untuk mengunci proses utama kontainer ke Mux publik
 exec env \
